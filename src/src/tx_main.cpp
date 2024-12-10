@@ -11,17 +11,23 @@
 
 #include "devHandset.h"
 #include "devLED.h"
-#include "devScreen.h"
-#include "devBuzzer.h"
-#include "devBLE.h"
 #include "devLUA.h"
 #include "devWIFI.h"
 #include "devButton.h"
 #include "devVTX.h"
+#if defined(PLATFORM_ESP32)
+#include "devScreen.h"
+#include "devBLE.h"
 #include "devGsensor.h"
 #include "devThermal.h"
 #include "devPDET.h"
 #include "devBackpack.h"
+#else
+// Fake functions for 8285
+void checkBackpackUpdate() {}
+void sendCRSFTelemetryToBackpack(uint8_t *) {}
+void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
+#endif
 
 #include "MAVLink.h"
 
@@ -53,10 +59,8 @@ FIFO<UART_INPUT_BUF_LEN> uartInputBuffer;
 
 uint8_t mavlinkSSBuffer[CRSF_MAX_PACKET_LEN]; // Buffer for current stubbon sender packet (mavlink only)
 
-#if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
 unsigned long rebootTime = 0;
 extern bool webserverPreventAutoStart;
-#endif
 //// MSP Data Handling ///////
 bool NextPacketIsMspData = false;  // if true the next packet will contain the msp data
 char backpackVersion[32] = "";
@@ -86,10 +90,8 @@ static uint8_t BindingSendCount;
 bool RxWiFiReadyToSend = false;
 
 bool headTrackingEnabled = false;
-#if !defined(CRITICAL_FLASH)
 static uint16_t ptrChannelData[3] = {CRSF_CHANNEL_VALUE_MID, CRSF_CHANNEL_VALUE_MID, CRSF_CHANNEL_VALUE_MID};
 static uint32_t lastPTRValidTimeMs;
-#endif
 
 static TxTlmRcvPhase_e TelemetryRcvPhase = ttrpTransmitting;
 StubbornReceiver TelemetryReceiver;
@@ -98,46 +100,23 @@ uint8_t CRSFinBuffer[CRSF_MAX_PACKET_LEN+1];
 
 device_affinity_t ui_devices[] = {
   {&Handset_device, 1},
-#ifdef HAS_LED
   {&LED_device, 0},
-#endif
-#ifdef HAS_RGB
   {&RGB_device, 0},
-#endif
   {&LUA_device, 1},
-#if defined(USE_TX_BACKPACK)
-  {&Backpack_device, 0},
-#endif
-#ifdef HAS_BLE
-  {&BLE_device, 0},
-#endif
-#ifdef HAS_BUZZER
-  {&Buzzer_device, 0},
-#endif
-#ifdef HAS_WIFI
   {&WIFI_device, 0},
-#endif
-#ifdef HAS_BUTTON
   {&Button_device, 0},
-#endif
-#ifdef HAS_SCREEN
+#if defined(PLATFORM_ESP32)
+  {&Backpack_device, 0},
+  {&BLE_device, 0},
   {&Screen_device, 0},
-#endif
-#ifdef HAS_GSENSOR
   {&Gsensor_device, 0},
-#endif
-#if defined(HAS_THERMAL) || defined(HAS_FAN)
   {&Thermal_device, 0},
-#endif
-#if defined(GPIO_PIN_PA_PDET)
   {&PDET_device, 0},
 #endif
   {&VTX_device, 0}
 };
 
-#if defined(GPIO_PIN_ANT_CTRL)
-    static bool diversityAntennaState = LOW;
-#endif
+static bool diversityAntennaState = LOW;
 
 void switchDiversityAntennas()
 {
@@ -175,7 +154,7 @@ void ICACHE_RAM_ATTR LinkStatsFromOta(OTA_LinkStats_s * const ls)
   // -- uplink_TX_Power is updated when sending to the handset, so it updates when missing telemetry
   // -- rf_mode is updated when we change rates
   // -- downlink_Link_quality is updated before the LQ period is incremented
-  MspSender.ConfirmCurrentPayload(ls->mspConfirm);
+  MspSender.ConfirmCurrentPayload(ls->tlmConfirm);
 }
 
 bool ICACHE_RAM_ATTR ProcessTLMpacket(SX12xxDriverCommon::rx_status const status)
@@ -193,12 +172,6 @@ bool ICACHE_RAM_ATTR ProcessTLMpacket(SX12xxDriverCommon::rx_status const status
     return false;
   }
 
-  if (otaPktPtr->std.type != PACKET_TYPE_TLM)
-  {
-    DBGLN("TLM type error %d", otaPktPtr->std.type);
-    return false;
-  }
-
   LastTLMpacketRecvMillis = millis();
   LQCalc.add();
 
@@ -213,43 +186,53 @@ bool ICACHE_RAM_ATTR ProcessTLMpacket(SX12xxDriverCommon::rx_status const status
     OTA_Packet8_s * const ota8 = (OTA_Packet8_s * const)otaPktPtr;
     uint8_t *telemPtr;
     uint8_t dataLen;
-    if (ota8->tlm_dl.containsLinkStats)
+    
+    switch (otaPktPtr->std.type)
     {
-      LinkStatsFromOta(&ota8->tlm_dl.ul_link_stats.stats);
-      telemPtr = ota8->tlm_dl.ul_link_stats.payload;
-      dataLen = sizeof(ota8->tlm_dl.ul_link_stats.payload);
+      case PACKET_TYPE_LINKSTATS:
+        LinkStatsFromOta(&ota8->tlm_dl.ul_link_stats.stats);
+        telemPtr = ota8->tlm_dl.ul_link_stats.payload;
+        dataLen = sizeof(ota8->tlm_dl.ul_link_stats.payload);
+        break;
+
+      case PACKET_TYPE_DATA:
+        if (firmwareOptions.is_airport)
+        {
+          OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
+        }
+        else
+        {
+          telemPtr = ota8->tlm_dl.payload;
+          dataLen = sizeof(ota8->tlm_dl.payload);
+          MspSender.ConfirmCurrentPayload(ota8->tlm_dl.tlmConfirm);
+        }
+        break;
     }
-    else
-    {
-      if (firmwareOptions.is_airport)
-      {
-        OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
-        return true;
-      }
-      telemPtr = ota8->tlm_dl.payload;
-      dataLen = sizeof(ota8->tlm_dl.payload);
-    }
+
     //DBGLN("pi=%u len=%u", ota8->tlm_dl.packageIndex, dataLen);
     TelemetryReceiver.ReceiveData(ota8->tlm_dl.packageIndex & ELRS8_TELEMETRY_MAX_PACKAGES, telemPtr, dataLen);
   }
   // Std res mode
   else
   {
-    switch (otaPktPtr->std.tlm_dl.type)
+    switch (otaPktPtr->std.type)
     {
-      case ELRS_TELEMETRY_TYPE_LINK:
+      case PACKET_TYPE_LINKSTATS:
         LinkStatsFromOta(&otaPktPtr->std.tlm_dl.ul_link_stats.stats);
         break;
 
-      case ELRS_TELEMETRY_TYPE_DATA:
+      case PACKET_TYPE_DATA:
         if (firmwareOptions.is_airport)
         {
           OtaUnpackAirportData(otaPktPtr, &apOutputBuffer);
-          return true;
         }
-        TelemetryReceiver.ReceiveData(otaPktPtr->std.tlm_dl.packageIndex & ELRS4_TELEMETRY_MAX_PACKAGES,
-          otaPktPtr->std.tlm_dl.payload,
-          sizeof(otaPktPtr->std.tlm_dl.payload));
+        else
+        {
+          MspSender.ConfirmCurrentPayload(otaPktPtr->std.tlm_dl.tlmConfirm);
+          TelemetryReceiver.ReceiveData(otaPktPtr->std.tlm_dl.packageIndex & ELRS4_TELEMETRY_MAX_PACKAGES,
+            otaPktPtr->std.tlm_dl.payload,
+            sizeof(otaPktPtr->std.tlm_dl.payload));
+        }
         break;
     }
   }
@@ -318,10 +301,11 @@ void ICACHE_RAM_ATTR GenerateSyncPacketData(OTA_Sync_s * const syncPtr)
 
   syncPtr->fhssIndex = FHSSgetCurrIndex();
   syncPtr->nonce = OtaNonce;
-  syncPtr->rateIndex = Index;
-  syncPtr->newTlmRatio = newTlmRatio - TLM_RATIO_NO_TLM;
+  syncPtr->rfRateEnum = get_elrs_airRateConfig(Index)->enum_rate;
   syncPtr->switchEncMode = SwitchEncMode;
-  syncPtr->UID3 = UID[3];
+  syncPtr->newTlmRatio = newTlmRatio - TLM_RATIO_NO_TLM;
+  syncPtr->geminiMode = isDualRadio() && config.GetAntennaMode() == TX_RADIO_MODE_GEMINI;
+  syncPtr->otaProtocol = config.GetLinkMode();
   syncPtr->UID4 = UID[4];
   syncPtr->UID5 = UID[5];
 
@@ -347,7 +331,6 @@ void SetRFLinkRate(uint8_t index) // Set speed of RF link
 
   if ((ModParams == ExpressLRS_currAirRate_Modparams)
     && (RFperf == ExpressLRS_currAirRate_RFperfParams)
-    && (invertIQ == Radio.IQinverted)
     && (OtaSwitchModeCurrent == newSwitchMode))
     return;
 
@@ -447,7 +430,7 @@ void ICACHE_RAM_ATTR HandlePrepareForTLM()
 
 void injectBackpackPanTiltRollData(uint32_t const now)
 {
-#if !defined(CRITICAL_FLASH)
+#if defined(PLATFORM_ESP32)
   // Do not override channels if the backpack is NOT communicating or PanTiltRoll is disabled
   if (config.GetPTREnableChannel() == HT_OFF || backpackVersion[0] == 0)
   {
@@ -539,16 +522,20 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
   }
   else
   {
-    if ((NextPacketIsMspData && MspSender.IsActive()) || dontSendChannelData)
+    if (firmwareOptions.is_airport)
     {
-      otaPkt.std.type = PACKET_TYPE_MSPDATA;
+      OtaPackAirportData(&otaPkt, &apInputBuffer);
+    }
+    else if ((NextPacketIsMspData && MspSender.IsActive()) || dontSendChannelData)
+    {
+      otaPkt.std.type = PACKET_TYPE_DATA;
       if (OtaIsFullRes)
       {
         otaPkt.full.msp_ul.packageIndex = MspSender.GetCurrentPayload(
           otaPkt.full.msp_ul.payload,
           sizeof(otaPkt.full.msp_ul.payload));
         if (config.GetLinkMode() == TX_MAVLINK_MODE)
-          otaPkt.full.msp_ul.tlmFlag = TelemetryReceiver.GetCurrentConfirm();
+          otaPkt.full.msp_ul.tlmConfirm = TelemetryReceiver.GetCurrentConfirm();
       }
       else
       {
@@ -556,7 +543,7 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
           otaPkt.std.msp_ul.payload,
           sizeof(otaPkt.std.msp_ul.payload));
         if (config.GetLinkMode() == TX_MAVLINK_MODE)
-          otaPkt.std.msp_ul.tlmFlag = TelemetryReceiver.GetCurrentConfirm();
+          otaPkt.std.msp_ul.tlmConfirm = TelemetryReceiver.GetCurrentConfirm();
       }
 
       // send channel data next so the channel messages also get sent during msp transmissions
@@ -699,9 +686,7 @@ static void UARTdisconnected()
 
 static void UARTconnected()
 {
-  #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
   webserverPreventAutoStart = true;
-  #endif
   rfModeLastChangedMS = millis(); // force syncspam on first packets
 
   auto index = adjustPacketRateForBaud(config.GetRate());
@@ -920,7 +905,6 @@ static void CheckReadyToSend()
   }
 }
 
-#if !defined(CRITICAL_FLASH)
 void OnPowerGetCalibration(mspPacket_t *packet)
 {
   uint8_t index = packet->readByte();
@@ -950,7 +934,6 @@ void OnPowerSetCalibration(mspPacket_t *packet)
   DBGLN("power calibration done %d, %d", index, value);
   hwTimer::resume();
 }
-#endif
 
 void SendUIDOverMSP()
 {
@@ -998,8 +981,8 @@ static void ExitBindingMode()
   // Reset CRCInit to UID-defined value
   OtaUpdateCrcInitFromUid();
   InBindingMode = false; // Clear binding mode before SetRFLinkRate() for correct IQ
-
-  SetRFLinkRate(config.GetRate()); //return to original rate
+  
+  UARTconnected();
 
   DBGLN("Exiting binding mode");
 }
@@ -1012,7 +995,7 @@ void EnterBindingModeSafely()
 
 void ProcessMSPPacket(uint32_t now, mspPacket_t *packet)
 {
-#if !defined(CRITICAL_FLASH)
+#if defined(PLATFORM_ESP32)
   // Inspect packet for ELRS specific opcodes
   if (packet->function == MSP_ELRS_FUNC)
   {
@@ -1052,12 +1035,12 @@ void ProcessMSPPacket(uint32_t now, mspPacket_t *packet)
     ptrChannelData[2] = packet->payload[4] + (packet->payload[5] << 8);
     lastPTRValidTimeMs = now;
   }
-#endif
   if (packet->function == MSP_ELRS_GET_BACKPACK_VERSION)
   {
     memset(backpackVersion, 0, sizeof(backpackVersion));
     memcpy(backpackVersion, packet->payload, min((size_t)packet->payloadSize, sizeof(backpackVersion)-1));
   }
+#endif
 }
 
 void ParseMSPData(uint8_t *buf, uint8_t size)
@@ -1251,7 +1234,6 @@ static void setupTarget()
 
 bool setupHardwareFromOptions()
 {
-#if defined(TARGET_UNIFIED_TX)
   if (!options_init())
   {
     // Register the WiFi with the framework
@@ -1264,10 +1246,6 @@ bool setupHardwareFromOptions()
     connectionState = hardwareUndefined;
     return false;
   }
-#else
-  options_init();
-#endif
-
   return true;
 }
 
@@ -1382,10 +1360,8 @@ void setup()
     TxBackpack = new NullStream();
   }
 
-#if defined(HAS_BUTTON)
   registerButtonFunction(ACTION_BIND, EnterBindingMode);
   registerButtonFunction(ACTION_INCREASE_POWER, cyclePower);
-#endif
 
   devicesStart();
 
@@ -1421,12 +1397,10 @@ void loop()
   // Not a device because it must be run on the loop core
   checkBackpackUpdate();
 
-  #if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
-    // If the reboot time is set and the current time is past the reboot time then reboot.
-    if (rebootTime != 0 && now > rebootTime) {
-      ESP.restart();
-    }
-  #endif
+  // If the reboot time is set and the current time is past the reboot time then reboot.
+  if (rebootTime != 0 && now > rebootTime) {
+    ESP.restart();
+  }
 
   executeDeferredFunction(micros());
 
