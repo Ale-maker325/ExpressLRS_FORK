@@ -5,6 +5,7 @@
 #include "logging.h"
 #include "rxtx_intf.h"
 
+#if defined(TARGET_RX)
 static int8_t servoPins[PWM_MAX_CHANNELS];
 static pwm_channel_t pwmChannels[PWM_MAX_CHANNELS];
 static uint16_t pwmChannelValues[PWM_MAX_CHANNELS];
@@ -268,3 +269,6 @@ device_t ServoOut_device = {
     .timeout = timeout,
     .subscribe = EVENT_CONNECTION_CHANGED
 };
+
+
+#endif
